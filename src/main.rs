@@ -4,6 +4,7 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
 use itertools::Itertools as _;
 use petgraph::{dot::Dot, visit::EdgeRef};
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Mode {
@@ -27,53 +28,68 @@ struct Args {
     file: PathBuf,
 }
 
-fn build_dbg(
-    tokens: &[&str],
-    separator: &str,
+fn build_dbg<'v, 's>(
+    tokens: &'s [&'v str],
     context: usize,
-) -> petgraph::graph::DiGraph<String, u16> {
-    let mut nodes = HashMap::new();
+) -> petgraph::graph::DiGraph<&'s [&'v str], u16> {
+    let (_, g) = tokens
+        .par_windows(context)
+        .zip(tokens.par_windows(context).skip(1))
+        .fold_with(
+            (HashMap::new(), petgraph::graph::DiGraph::new()),
+            |(mut nodes, mut g), (cur, next)| {
+                let cur_node = *nodes.entry(cur).or_insert_with(|| g.add_node(cur));
+                let next_node = *nodes.entry(next).or_insert_with(|| g.add_node(next));
 
-    tokens.windows(context).array_windows::<2>().fold(
-        petgraph::graph::DiGraph::new(),
-        |mut g, [cur, next]| {
-            let cur_node = *nodes
-                .entry(cur)
-                .or_insert_with(|| g.add_node(cur.join(separator)));
+                let edge_weight = g
+                    .edges_connecting(cur_node, next_node)
+                    .next()
+                    .map_or(0, |e| *e.weight());
 
-            let next_node = *nodes
-                .entry(next)
-                .or_insert_with(|| g.add_node(next.join(separator)));
+                g.update_edge(cur_node, next_node, edge_weight + 1);
 
-            let edge_weight = g
-                .edges_connecting(cur_node, next_node)
-                .next()
-                .map_or(0, |e| *e.weight());
+                (nodes, g)
+            },
+        )
+        .reduce(
+            || (HashMap::new(), petgraph::graph::DiGraph::new()),
+            |mut left, right| {
+                for (rsource, rtarget, rweight) in right
+                    .1
+                    .edge_references()
+                    .map(|e| (e.source(), e.target(), *e.weight()))
+                {
+                    let rsource_weight = right.1.node_weight(rsource).unwrap();
+                    let rtarget_weight = right.1.node_weight(rtarget).unwrap();
 
-            g.update_edge(cur_node, next_node, edge_weight + 1);
+                    let lsource = *left
+                        .0
+                        .entry(rsource_weight)
+                        .or_insert_with(|| left.1.add_node(rsource_weight));
 
-            g
-        },
-    )
-}
+                    let ltarget = *left
+                        .0
+                        .entry(rtarget_weight)
+                        .or_insert_with(|| left.1.add_node(rtarget_weight));
 
-fn parse_weights(context: usize, mode: Mode, input: &str) -> petgraph::graph::DiGraph<String, u16> {
-    match mode {
-        Mode::Words => {
-            let tokens = input.split_whitespace().collect_vec();
+                    let edge_weight = left
+                        .1
+                        .edges_connecting(lsource, ltarget)
+                        .next()
+                        .map_or(0, |e| *e.weight());
 
-            build_dbg(&tokens, " ", context)
-        }
-        Mode::Letters => {
-            let tokens = input.split("").filter(|s| !s.is_empty()).collect_vec();
+                    left.1.update_edge(lsource, ltarget, edge_weight + rweight);
+                }
 
-            build_dbg(&tokens, "", context)
-        }
-    }
+                left
+            },
+        );
+
+    g
 }
 
 #[allow(dead_code)]
-fn dbg_to_dot(dbg: &petgraph::graph::DiGraph<String, u16>) -> String {
+fn dbg_to_dot(dbg: &petgraph::graph::DiGraph<&[&str], u16>) -> String {
     let max_weight = dbg.edge_weights().max().copied().unwrap_or(1) as f64;
     let max_penwidth = 5.0;
 
@@ -96,12 +112,17 @@ fn dbg_to_dot(dbg: &petgraph::graph::DiGraph<String, u16>) -> String {
 
 #[allow(dead_code)]
 fn print_markov(
-    dbg: &petgraph::graph::DiGraph<String, u16>,
+    dbg: &petgraph::graph::DiGraph<&[&str], u16>,
     start: petgraph::graph::NodeIndex,
     mode: Mode,
     length: usize,
 ) {
-    print!("{}", dbg.node_weight(start).unwrap());
+    let separator = match mode {
+        Mode::Words => " ",
+        Mode::Letters => "",
+    };
+
+    print!("{}", dbg.node_weight(start).unwrap().join(separator));
     let mut next = start;
     for _ in 0..length {
         let outgoing_edges = dbg
@@ -112,7 +133,10 @@ fn print_markov(
             break;
         }
 
-        let total_weight = outgoing_edges.iter().map(|e| *e.weight()).sum::<u16>() as usize;
+        let total_weight = outgoing_edges
+            .iter()
+            .map(|e| *e.weight() as u32)
+            .sum::<u32>() as usize;
         let idx = fastrand::usize(0..total_weight);
 
         let mut cumulative_weight = 0;
@@ -127,17 +151,8 @@ fn print_markov(
         let transition = {
             let raw_weight = dbg.node_weight(next).unwrap();
 
-            match mode {
-                Mode::Words => &format!(
-                    " {}",
-                    raw_weight.split_whitespace().next_back().unwrap_or("")
-                ),
-                Mode::Letters => raw_weight
-                    .split("")
-                    .filter(|s| !s.is_empty())
-                    .last()
-                    .unwrap_or(""),
-            }
+            let last = raw_weight.last().unwrap();
+            format!("{separator}{last}")
         };
         print!("{}", transition);
     }
@@ -154,7 +169,17 @@ fn main() -> Result<()> {
         file,
     } = args;
 
-    let dbg = parse_weights(context, mode, &std::fs::read_to_string(file)?);
+    let time = std::time::Instant::now();
+
+    let input = std::fs::read_to_string(&file).context("failed to read input file")?;
+
+    let tokens = match mode {
+        Mode::Words => input.split_whitespace().collect_vec(),
+        Mode::Letters => input.split("").filter(|s| !s.is_empty()).collect_vec(),
+    };
+    let dbg = build_dbg(&tokens, context);
+
+    eprintln!("Parsed {} nodes in {:?}", dbg.node_count(), time.elapsed());
 
     let start = fastrand::choice(dbg.node_indices()).context("no nodes")?;
     // let start = petgraph::graph::NodeIndex::new(0);
